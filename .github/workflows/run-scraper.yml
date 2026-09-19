@@ -24,6 +24,9 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --disable-pip-version-check -r requirements.txt
 
+      - name: Test retail size expansion
+        run: python -m unittest discover -s tests -v
+
       - name: Run scraper
         run: python scraper.py
 
