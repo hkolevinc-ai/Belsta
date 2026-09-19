@@ -31,6 +31,7 @@ QUANTITY = 100
 PACKAGE_LENGTH_CM = 20
 PACKAGE_WIDTH_CM = 10
 PACKAGE_HEIGHT_CM = 5
+RETAIL_PAIR_WEIGHT_G = 500
 HANDLING_TIME = "1 Day"
 FULFILLMENT_CHANNEL = "I will ship this item myself"
 COUNTRY_OF_ORIGIN = "Ukraine"
@@ -180,6 +181,9 @@ class OutputVariant:
     canonical_url: str
     category: str
     size: str
+    source_size: str
+    source_pack_pairs: int
+    retail_from_pack: bool
     source_color: str
     temu_color: str
     sku_images: list[str]
@@ -451,7 +455,10 @@ def select_variants(
             detail_images = all_product_images
 
         for variant in selected_for_product:
-            size = variant_option(variant, size_index)
+            source_size = variant_option(variant, size_index) or "One Size"
+            retail_sizes = expand_size_range(source_size)
+            retail_from_pack = len(retail_sizes) > 1
+            source_pack_pairs = count_pairs(source_size) if retail_from_pack else 1
             color = variant_option(variant, color_index) or "Default"
             sku_images = list(groups.get(color, []))
             featured = canonical_image_url((variant.get("featured_image") or {}).get("src"))
@@ -462,26 +469,40 @@ def select_variants(
 
             canonical_url = f"{SITE}/products/{handle}?{urlencode({'variant': variant.get('id')})}"
             category = classify_category(product)
-            output.append(
-                OutputVariant(
-                    product=product,
-                    variant=variant,
-                    canonical_url=canonical_url,
-                    category=category,
-                    size=size or "One Size",
-                    source_color=color,
-                    temu_color=temu_color(color, category),
-                    sku_images=sku_images[:10],
-                    detail_images=detail_images[:30],
+            for retail_size in retail_sizes:
+                output.append(
+                    OutputVariant(
+                        product=product,
+                        variant=variant,
+                        canonical_url=canonical_url,
+                        category=category,
+                        size=retail_size,
+                        source_size=source_size,
+                        source_pack_pairs=source_pack_pairs,
+                        retail_from_pack=retail_from_pack,
+                        source_color=color,
+                        temu_color=temu_color(color, category),
+                        sku_images=sku_images[:10],
+                        detail_images=detail_images[:30],
+                    )
                 )
-            )
 
         if not selected_for_product:
             warnings.append(f"No currently available sizes were found for the selected color(s) of {handle}.")
 
-    unique: dict[str, OutputVariant] = {}
+    # Several wholesale variants can describe different pack compositions for
+    # the same product, colour and retail size. Temu needs one row per unique
+    # sellable combination, so keep the lowest per-pair source price.
+    unique: dict[tuple[str, str, str], OutputVariant] = {}
     for item in output:
-        unique[str(item.variant.get("id"))] = item
+        key = (
+            str(item.product.get("id")),
+            item.source_color.casefold(),
+            item.size.casefold(),
+        )
+        previous = unique.get(key)
+        if previous is None or retail_unit_price(item) < retail_unit_price(previous):
+            unique[key] = item
     return list(unique.values()), warnings
 
 
@@ -578,8 +599,20 @@ def foot_length(size: str, category: str) -> float | str:
     return FOOT_LENGTH_CM.get(clean, "")
 
 
+def expand_size_range(size_label: str) -> list[str]:
+    """Expand the first numeric shoe-size range into unique retail sizes."""
+    clean = normalize_space(size_label)
+    match = re.search(r"(?<!\d)(\d{2})\s*[-–—]\s*(\d{2})(?!\d)", clean)
+    if not match:
+        return [clean or "One Size"]
+    start, end = int(match.group(1)), int(match.group(2))
+    if start > end or end - start > 20:
+        return [clean]
+    return [str(size) for size in range(start, end + 1)]
+
+
 def count_pairs(size_label: str) -> int:
-    match = re.search(r"(\d{2})\s*[-–]\s*(\d{2})", size_label)
+    match = re.search(r"(\d{2})\s*[-–—]\s*(\d{2})", size_label)
     if not match:
         return 1
     start, end = int(match.group(1)), int(match.group(2))
@@ -588,6 +621,22 @@ def count_pairs(size_label: str) -> int:
     for multiplicity in re.findall(r"(\d+)\s*\*\s*\d+", size_label):
         extras += max(0, int(multiplicity) - 1)
     return base + extras
+
+
+def retail_unit_price(item: OutputVariant) -> float:
+    divisor = item.source_pack_pairs if item.retail_from_pack else 1
+    return float(item.variant.get("price") or 0) / max(1, divisor)
+
+
+def retail_product_title(title: str) -> str:
+    value = re.sub(r"^\s*Опаковка\s*:\s*", "", normalize_space(title), flags=re.IGNORECASE)
+    value = re.sub(r"\s+на\s+едро\b", "", value, flags=re.IGNORECASE)
+    return normalize_space(value)
+
+
+def sku_size_token(size: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9]+", "-", normalize_space(size)).strip("-")
+    return token or "ONE-SIZE"
 
 
 def build_workbook_rows(items: list[OutputVariant]) -> list[dict[str, Any]]:
@@ -599,19 +648,26 @@ def build_workbook_rows(items: list[OutputVariant]) -> list[dict[str, Any]]:
         description = html_to_text(description_html)[:2000]
         bullets = extract_bullets(description_html)
         upper, sole, insole = infer_materials(product)
-        is_pack = "опаковка" in normalize_space(product.get("title")).casefold()
-        pairs = count_pairs(item.size) if is_pack else 1
-        current_price = round(float(variant.get("price") or 0) / 100, 2)
+        price_divisor = item.source_pack_pairs if item.retail_from_pack else 1
+        current_price = round(float(variant.get("price") or 0) / 100 / price_divisor, 2)
         compare_price_raw = variant.get("compare_at_price")
-        compare_price = round(float(compare_price_raw) / 100, 2) if compare_price_raw else None
+        compare_price = (
+            round(float(compare_price_raw) / 100 / price_divisor, 2)
+            if compare_price_raw
+            else None
+        )
         parent_sku = f"BELSTA-{product.get('id')}"
         child_sku = f"BELSTA-{variant.get('id')}"
-        size_is_range = bool(re.search(r"\d\s*[-–]\s*\d", item.size))
+        if item.retail_from_pack:
+            child_sku += f"-{sku_size_token(item.size)}"
+        product_title = normalize_space(product.get("title"))
+        if item.retail_from_pack:
+            product_title = retail_product_title(product_title)
 
         values: dict[str, Any] = {
             "E": item.category,
             "G": "Normal product",
-            "L": normalize_space(product.get("title"))[:500],
+            "L": product_title[:500],
             "M": parent_sku,
             "N": child_sku,
             "O": "Add",
@@ -623,25 +679,25 @@ def build_workbook_rows(items: list[OutputVariant]) -> list[dict[str, Any]]:
             "FD": insole,
             "KF": "Color × Size",
             "KG": "3 - European Size",
-            "KH": "4 - Numeric range" if size_is_range else "7 - Numeric",
+            "KH": "7 - Numeric",
             "KI": item.size,
             "KJ": item.temu_color,
-            "KK": "Add size chart manually" if not size_is_range else "",
-            "KM": "cm-g-ml" if not size_is_range else "",
-            "KN": item.size if not size_is_range and item.size.isdigit() else "",
+            "KK": "Add size chart manually",
+            "KM": "cm-g-ml",
+            "KN": item.size if item.size.isdigit() else "",
             "KO": foot_length(item.size, item.category),
             "LY": QUANTITY,
             "LZ": current_price,
             "MA": item.canonical_url,
-            "MD": float(variant.get("weight") or 500),
+            "MD": RETAIL_PAIR_WEIGHT_G if item.retail_from_pack else float(variant.get("weight") or 500),
             "ME": PACKAGE_LENGTH_CM,
             "MF": PACKAGE_WIDTH_CM,
             "MG": PACKAGE_HEIGHT_CM,
-            "MH": "Multi-piece set" if is_pack else "Single set",
-            "MI": "No" if is_pack else "Yes",
+            "MH": "Single set",
+            "MI": "Yes",
             "MJ": 1,
-            "MK": "pack" if is_pack else "pair",
-            "ML": pairs,
+            "MK": "pair",
+            "ML": 1,
             "MM": "pair",
             "MS": SHIPPING_TEMPLATE,
             "MT": HANDLING_TIME,
@@ -847,6 +903,9 @@ def write_report(path: Path, items: list[OutputVariant]) -> None:
                 "Source color",
                 "Temu color",
                 "Size",
+                "Source wholesale size",
+                "Pairs in source pack",
+                "Retail row from wholesale pack",
                 "Shopify variant ID",
                 "Source SKU",
                 "Available",
@@ -865,6 +924,9 @@ def write_report(path: Path, items: list[OutputVariant]) -> None:
                     item.source_color,
                     item.temu_color,
                     item.size,
+                    item.source_size,
+                    item.source_pack_pairs,
+                    item.retail_from_pack,
                     variant.get("id"),
                     normalize_space(variant.get("sku")),
                     variant.get("available"),
@@ -890,6 +952,13 @@ def write_summary(
     exact_duplicates = len(selections) - len({item.original_url for item in selections})
     product_level_links = sum(item.variant_id is None for item in selections)
     selected_colors = {(item.product.get("id"), item.source_color) for item in items}
+    source_variants = {(item.product.get("id"), item.variant.get("id")) for item in items}
+    wholesale_source_variants = {
+        (item.product.get("id"), item.variant.get("id"))
+        for item in items
+        if item.retail_from_pack
+    }
+    retail_rows_from_packs = sum(item.retail_from_pack for item in items)
     lines = [
         "BELSTA → Temu scraper summary",
         "",
@@ -898,6 +967,9 @@ def write_summary(
         f"Product links without variant ID: {product_level_links}",
         f"Products fetched: {len(products)}",
         f"Selected product/color groups: {len(selected_colors)}",
+        f"Source Shopify variants used: {len(source_variants)}",
+        f"Wholesale source variants split by size: {len(wholesale_source_variants)}",
+        f"Retail rows created from wholesale packs: {retail_rows_from_packs}",
         f"Output SKU rows: {len(items)}",
         f"Quantity per SKU: {QUANTITY}",
         f"Package dimensions: {PACKAGE_LENGTH_CM} × {PACKAGE_WIDTH_CM} × {PACKAGE_HEIGHT_CM} cm",
@@ -908,6 +980,9 @@ def write_summary(
         "Selection rule:",
         "- A link with a variant ID selects that variant's color and all currently available sizes in that color.",
         "- A product link without a variant ID selects all currently available variants of that product.",
+        "- A wholesale size range is expanded to one unique row for every individual size.",
+        "- Wholesale pack prices are divided by the number of pairs in the source pack.",
+        "- Duplicate product/color/size combinations are merged using the lowest per-pair source price.",
         "",
     ]
     if warnings:
