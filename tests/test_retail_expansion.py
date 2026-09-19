@@ -73,6 +73,83 @@ class RetailExpansionTests(unittest.TestCase):
         self.assertTrue(all(row["ML"] == 1 for row in rows))
         self.assertEqual(len({row["N"] for row in rows}), 5)
 
+    def test_link_without_variant_uses_only_default_color(self):
+        product = {
+            "id": 200,
+            "handle": "default-color",
+            "title": "Дамски пантофи",
+            "description": "",
+            "options": [{"name": "Размер"}, {"name": "Цвят"}],
+            "images": ["https://example.com/pink.jpg", "https://example.com/blue.jpg"],
+            "variants": [
+                {
+                    "id": 201,
+                    "available": True,
+                    "option1": "36",
+                    "option2": "Розов",
+                    "price": 1000,
+                    "weight": 500,
+                    "featured_image": {"src": "https://example.com/pink.jpg"},
+                },
+                {
+                    "id": 202,
+                    "available": True,
+                    "option1": "37",
+                    "option2": "Розов",
+                    "price": 1000,
+                    "weight": 500,
+                    "featured_image": {"src": "https://example.com/pink.jpg"},
+                },
+                {
+                    "id": 203,
+                    "available": True,
+                    "option1": "36",
+                    "option2": "Син",
+                    "price": 1000,
+                    "weight": 500,
+                    "featured_image": {"src": "https://example.com/blue.jpg"},
+                },
+            ],
+        }
+        selection = SCRAPER.InputSelection(
+            row_number=2,
+            original_url="https://www.belsta.bg/products/default-color",
+            handle="default-color",
+            variant_id=None,
+        )
+
+        items, warnings = SCRAPER.select_variants([selection], {"default-color": product})
+
+        self.assertEqual(warnings, [])
+        self.assertEqual([item.size for item in items], ["36", "37"])
+        self.assertEqual({item.source_color for item in items}, {"Розов"})
+
+    def test_color_collisions_are_disambiguated(self):
+        women = SCRAPER.assign_temu_colors(
+            ["Розов", "Флорален"], SCRAPER.CATEGORY_WOMEN_SLIPPERS
+        )
+        blues = SCRAPER.assign_temu_colors(
+            ["Blue", "Син"], SCRAPER.CATEGORY_GIRLS_SLIPPERS
+        )
+
+        self.assertEqual(women, {"Розов": "Pink", "Флорален": "Deep Pink"})
+        self.assertEqual(blues, {"Blue": "Blue", "Син": "Royal Blue"})
+
+    def test_wholesale_bundle_images_are_blocked(self):
+        blocked = (
+            "https://cdn.shopify.com/files/"
+            "84b23fa3b996d126681d2788ff34ba9c_example.jpg?v=1"
+        )
+        blocked_exact = (
+            "https://cdn.shopify.com/files/"
+            "1_51684791-009f-4c11-9d76-741ed70bcc42.png?v=1"
+        )
+        normal = "https://cdn.shopify.com/files/retail_pair.jpg?v=1"
+
+        self.assertTrue(SCRAPER.is_wholesale_image_url(blocked))
+        self.assertTrue(SCRAPER.is_wholesale_image_url(blocked_exact))
+        self.assertFalse(SCRAPER.is_wholesale_image_url(normal))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -165,6 +165,31 @@ COLOR_MAP = {
     "silver": "Silvery Grey",
 }
 
+# Visually reviewed BELSTA images that show a wholesale bundle containing many
+# pairs. They must never be used in a retail Temu listing.
+WHOLESALE_IMAGE_MARKERS = (
+    "84b23fa3b996d126681d2788ff34ba9c_",
+    "firefly_seed367966",
+)
+WHOLESALE_IMAGE_FILENAMES = {
+    "1_9d7ea284-df25-41b7-9465-177f872d8948.png",
+    "1_51684791-009f-4c11-9d76-741ed70bcc42.png",
+    "43ae7dc775fdd74636c6ad8863a0196a.jpg",
+    "1_0904ac37-49f0-4202-8d8d-cae8db1e258c.png",
+    "1_0a8ed8a1-69fa-4ed2-8cea-25e3f1aeebbe.png",
+    "1_1da5a3f0-028a-4b2a-8370-0bb9e0dbd57a.png",
+}
+
+COLOR_COLLISION_ALTERNATIVES = {
+    "Pink": ["Deep Pink", "Bright Pink", "Fuchsia", "Magenta", "Dusty rose"],
+    "Blue": ["Royal Blue", "Navy Blue", "Light Blue", "Sky Blue", "Cyan"],
+    "Red": ["Deep red", "Scarlet", "Carmine", "Rose Red"],
+    "Green": ["Dark Green", "Emerald Green", "Light Green", "Olive Green"],
+    "Grey": ["Dark Grey", "Light Grey", "Graphite Color", "Slate Grey"],
+    "Brown": ["Dark Brown", "Light Brown", "Coffee", "Chocolate"],
+    "Purple": ["Deep purple", "Violet", "Lavender", "Fuchsia"],
+}
+
 
 @dataclass(frozen=True)
 class InputSelection:
@@ -331,8 +356,21 @@ def canonical_image_url(raw: str | None) -> str:
     return value
 
 
+def is_wholesale_image_url(raw: str | None) -> bool:
+    if not raw:
+        return False
+    filename = urlparse(str(raw)).path.rsplit("/", 1)[-1].casefold()
+    return filename in WHOLESALE_IMAGE_FILENAMES or any(
+        marker in filename for marker in WHOLESALE_IMAGE_MARKERS
+    )
+
+
 def image_groups_by_color(product: dict[str, Any], color_index: int | None) -> dict[str, list[str]]:
-    ordered_images = [canonical_image_url(url) for url in product.get("images", []) if url]
+    ordered_images = [
+        canonical_image_url(url)
+        for url in product.get("images", [])
+        if url and not is_wholesale_image_url(url)
+    ]
     if not ordered_images:
         return {}
 
@@ -341,7 +379,7 @@ def image_groups_by_color(product: dict[str, Any], color_index: int | None) -> d
     for variant in product.get("variants", []):
         color = variant_option(variant, color_index) or "Default"
         featured = canonical_image_url((variant.get("featured_image") or {}).get("src"))
-        if not featured or (color, featured) in seen:
+        if not featured or is_wholesale_image_url(featured) or (color, featured) in seen:
             continue
         seen.add((color, featured))
         try:
@@ -385,6 +423,28 @@ def temu_color(raw_color: str, category: str) -> str:
     return translated
 
 
+def assign_temu_colors(source_colors: list[str], category: str) -> dict[str, str]:
+    """Assign a unique valid Temu color to every distinct source color."""
+    assigned: dict[str, str] = {}
+    used: set[str] = set()
+    for source_color in source_colors:
+        if source_color in assigned:
+            continue
+        base = temu_color(source_color, category)
+        candidates: list[str] = [base]
+        if translate_color(source_color) == "Multicolor" and category == CATEGORY_WOMEN_SLIPPERS:
+            candidates.extend(["Deep Pink", "Bright Pink", "Fuchsia", "Magenta"])
+        candidates.extend(COLOR_COLLISION_ALTERNATIVES.get(base, []))
+        chosen = next((candidate for candidate in candidates if candidate not in used), None)
+        if chosen is None:
+            raise ValueError(
+                f"Could not assign a unique Temu color for {source_color!r} in category {category}."
+            )
+        assigned[source_color] = chosen
+        used.add(chosen)
+    return assigned
+
+
 def classify_category(product: dict[str, Any]) -> str:
     text = f"{product.get('title', '')} {product.get('handle', '')}".casefold()
     if any(token in text for token in ("myazhki", "mazhki", "мъжки")):
@@ -413,11 +473,19 @@ def select_variants(
         size_index, color_index = option_indexes(product)
         variants_by_id = {str(item.get("id")): item for item in product.get("variants", [])}
         chosen_colors: set[str] = set()
-        include_all_colors = False
 
         for selection in selections_by_handle[handle]:
             if selection.variant_id is None:
-                include_all_colors = True
+                selected_variant = next(
+                    (item for item in product.get("variants", []) if item.get("available")),
+                    None,
+                )
+                if selected_variant is None:
+                    warnings.append(
+                        f"Row {selection.row_number}: no available default variant was found for {handle}."
+                    )
+                    continue
+                chosen_colors.add(variant_option(selected_variant, color_index) or "Default")
                 continue
             selected_variant = variants_by_id.get(selection.variant_id)
             if selected_variant is None:
@@ -427,19 +495,23 @@ def select_variants(
                 continue
             chosen_colors.add(variant_option(selected_variant, color_index) or "Default")
 
-        if not chosen_colors and not include_all_colors:
+        if not chosen_colors:
             warnings.append(f"No valid selected variant remained for {handle}.")
             continue
 
         groups = image_groups_by_color(product, color_index)
-        all_product_images = [canonical_image_url(url) for url in product.get("images", []) if url]
+        all_product_images = [
+            canonical_image_url(url)
+            for url in product.get("images", [])
+            if url and not is_wholesale_image_url(url)
+        ]
         selected_for_product: list[dict[str, Any]] = []
 
         for variant in product.get("variants", []):
             if not variant.get("available"):
                 continue
             color = variant_option(variant, color_index) or "Default"
-            if not include_all_colors and color not in chosen_colors:
+            if color not in chosen_colors:
                 continue
             selected_for_product.append(variant)
 
@@ -454,6 +526,14 @@ def select_variants(
         if not detail_images:
             detail_images = all_product_images
 
+        category = classify_category(product)
+        ordered_source_colors = list(
+            dict.fromkeys(
+                variant_option(item, color_index) or "Default" for item in selected_for_product
+            )
+        )
+        temu_colors_by_source = assign_temu_colors(ordered_source_colors, category)
+
         for variant in selected_for_product:
             source_size = variant_option(variant, size_index) or "One Size"
             retail_sizes = expand_size_range(source_size)
@@ -462,13 +542,12 @@ def select_variants(
             color = variant_option(variant, color_index) or "Default"
             sku_images = list(groups.get(color, []))
             featured = canonical_image_url((variant.get("featured_image") or {}).get("src"))
-            if featured and featured not in sku_images:
+            if featured and not is_wholesale_image_url(featured) and featured not in sku_images:
                 sku_images.insert(0, featured)
             if not sku_images:
                 sku_images = detail_images[:1]
 
             canonical_url = f"{SITE}/products/{handle}?{urlencode({'variant': variant.get('id')})}"
-            category = classify_category(product)
             for retail_size in retail_sizes:
                 output.append(
                     OutputVariant(
@@ -481,7 +560,7 @@ def select_variants(
                         source_pack_pairs=source_pack_pairs,
                         retail_from_pack=retail_from_pack,
                         source_color=color,
-                        temu_color=temu_color(color, category),
+                        temu_color=temu_colors_by_source[color],
                         sku_images=sku_images[:10],
                         detail_images=detail_images[:30],
                     )
@@ -906,18 +985,28 @@ def write_report(path: Path, items: list[OutputVariant]) -> None:
                 "Source wholesale size",
                 "Pairs in source pack",
                 "Retail row from wholesale pack",
+                "Source pack Base price EUR",
+                "Retail Base price EUR",
+                "Source pack List price EUR",
+                "Retail List price EUR",
                 "Shopify variant ID",
                 "Source SKU",
                 "Available",
-                "Base price EUR",
-                "List price EUR",
-                "Weight g",
+                "Source weight g",
+                "Retail weight g",
                 "Category ID",
                 "Reference link",
             ]
         )
         for item in items:
             variant = item.variant
+            price_divisor = item.source_pack_pairs if item.retail_from_pack else 1
+            source_base_price = float(variant.get("price") or 0) / 100
+            source_list_price = (
+                float(variant.get("compare_at_price") or 0) / 100
+                if variant.get("compare_at_price")
+                else ""
+            )
             writer.writerow(
                 [
                     normalize_space(item.product.get("title")),
@@ -927,14 +1016,15 @@ def write_report(path: Path, items: list[OutputVariant]) -> None:
                     item.source_size,
                     item.source_pack_pairs,
                     item.retail_from_pack,
+                    source_base_price,
+                    round(source_base_price / price_divisor, 2),
+                    source_list_price,
+                    round(float(source_list_price) / price_divisor, 2) if source_list_price != "" else "",
                     variant.get("id"),
                     normalize_space(variant.get("sku")),
                     variant.get("available"),
-                    float(variant.get("price") or 0) / 100,
-                    float(variant.get("compare_at_price") or 0) / 100
-                    if variant.get("compare_at_price")
-                    else "",
                     variant.get("weight"),
+                    RETAIL_PAIR_WEIGHT_G if item.retail_from_pack else float(variant.get("weight") or 500),
                     item.category,
                     item.canonical_url,
                 ]
@@ -979,10 +1069,11 @@ def write_summary(
         "",
         "Selection rule:",
         "- A link with a variant ID selects that variant's color and all currently available sizes in that color.",
-        "- A product link without a variant ID selects all currently available variants of that product.",
+        "- A product link without a variant ID selects the first available color shown by the product page and all sizes in that color.",
         "- A wholesale size range is expanded to one unique row for every individual size.",
         "- Wholesale pack prices are divided by the number of pairs in the source pack.",
         "- Duplicate product/color/size combinations are merged using the lowest per-pair source price.",
+        "- Visually reviewed wholesale bundle images are excluded from SKU and detail images.",
         "",
     ]
     if warnings:
@@ -1025,6 +1116,7 @@ def validate_output(path: Path, expected_rows: int) -> None:
             }
 
     contribution_skus: set[str] = set()
+    variation_combinations: set[tuple[str, str, str]] = set()
     for row in range(5, 5 + expected_rows):
         required = {
             "Category": sheet.cell(row, column_index_from_string("E")).value,
@@ -1047,6 +1139,16 @@ def validate_output(path: Path, expected_rows: int) -> None:
         if contribution_sku in contribution_skus:
             raise RuntimeError(f"Duplicate Contribution SKU in output row {row}: {contribution_sku}")
         contribution_skus.add(contribution_sku)
+        variation_key = (
+            str(required["Contribution Goods"]),
+            color,
+            str(sheet.cell(row, column_index_from_string("KI")).value or ""),
+        )
+        if variation_key in variation_combinations:
+            raise RuntimeError(
+                f"Duplicate product/color/size combination in output row {row}: {variation_key}"
+            )
+        variation_combinations.add(variation_key)
         if sheet.cell(row, column_index_from_string("LY")).value != QUANTITY:
             raise RuntimeError(f"Output row {row} has an unexpected quantity.")
         dimensions = tuple(
@@ -1054,6 +1156,16 @@ def validate_output(path: Path, expected_rows: int) -> None:
         )
         if dimensions != (PACKAGE_LENGTH_CM, PACKAGE_WIDTH_CM, PACKAGE_HEIGHT_CM):
             raise RuntimeError(f"Output row {row} has unexpected package dimensions: {dimensions}")
+        image_columns = list(range(column_index_from_string("AA"), column_index_from_string("DQ") + 1))
+        image_columns.extend(
+            range(column_index_from_string("LO"), column_index_from_string("LX") + 1)
+        )
+        for column in image_columns:
+            image_url = sheet.cell(row, column).value
+            if is_wholesale_image_url(image_url):
+                raise RuntimeError(
+                    f"Output row {row} contains a wholesale bundle image in column {column}."
+                )
         base_price = float(sheet.cell(row, column_index_from_string("LZ")).value)
         list_price = sheet.cell(row, column_index_from_string("MB")).value
         no_list_price = sheet.cell(row, column_index_from_string("MC")).value
